@@ -1,0 +1,132 @@
+sources:
+  pa-sqlite:
+    kind: sqlite
+    database: /home/kumarsinghkartik44/productivity_assistant/pa_data.db
+
+tools:
+  add_task:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Add a new task. Provide title, description (optional), due_date as YYYY-MM-DD (optional), priority as low/medium/high (optional)."
+    parameters:
+      - name: title
+        type: string
+        description: "Task title"
+      - name: description
+        type: string
+        description: "Task description"
+      - name: due_date
+        type: string
+        description: "Due date in YYYY-MM-DD format"
+      - name: priority
+        type: string
+        description: "Priority: low, medium, or high"
+    statement: "INSERT INTO tasks (title, description, due_date, priority, status) VALUES (?, ?, ?, ?, 'pending')"
+
+  get_tasks:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Get all pending tasks ordered by priority and due date."
+    statement: "SELECT id, title, description, due_date, priority, status FROM tasks WHERE status != 'done' ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, due_date ASC"
+
+  complete_task:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Mark a task as done by its numeric ID."
+    parameters:
+      - name: task_id
+        type: integer
+        description: "The numeric ID of the task to mark as done"
+    statement: "UPDATE tasks SET status = 'done' WHERE id = ?"
+
+  add_event:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Add a calendar event. Provide title, date as YYYY-MM-DD, time as HH:MM (optional), reminder_minutes as integer (optional), location (optional), notes (optional)."
+    parameters:
+      - name: title
+        type: string
+        description: "Event title"
+      - name: date
+        type: string
+        description: "Event date in YYYY-MM-DD format"
+      - name: time
+        type: string
+        description: "Event time in HH:MM format"
+      - name: reminder_minutes
+        type: integer
+        description: "Minutes before event to remind"
+      - name: location
+        type: string
+        description: "Event location"
+      - name: notes
+        type: string
+        description: "Additional notes"
+    statement: "INSERT INTO events (title, date, time, reminder_minutes, location, notes) VALUES (?, ?, ?, ?, ?, ?)"
+
+  get_events:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Get all upcoming events ordered by date and time."
+    statement: "SELECT id, title, date, time, reminder_minutes, location, notes FROM events WHERE date >= date('now') ORDER BY date ASC, time ASC"
+
+  add_note:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Save a note with a title, content, and optional comma-separated tags."
+    parameters:
+      - name: title
+        type: string
+        description: "Note title"
+      - name: content
+        type: string
+        description: "Full note content"
+      - name: tags
+        type: string
+        description: "Comma-separated tags"
+    statement: "INSERT INTO notes (title, content, tags) VALUES (?, ?, ?)"
+
+  search_notes:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Search notes by keyword across title, content, and tags. Returns up to 5 results."
+    parameters:
+      - name: query
+        type: string
+        description: "Search keyword"
+    statement: "SELECT id, title, content, tags, created_at FROM notes WHERE title LIKE '%' || ? || '%' OR content LIKE '%' || ? || '%' OR tags LIKE '%' || ? || '%' ORDER BY created_at DESC LIMIT 5"
+
+  add_checklist_item:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Add an item to a named checklist such as grocery or packing. Provide list_name and item."
+    parameters:
+      - name: list_name
+        type: string
+        description: "Name of the list, e.g. grocery, packing"
+      - name: item
+        type: string
+        description: "The item to add to the list"
+    statement: "INSERT INTO checklists (list_name, item) VALUES (?, ?)"
+
+  get_checklist:
+    kind: sqlite-sql
+    source: pa-sqlite
+    description: "Get all unchecked items from a specific named checklist."
+    parameters:
+      - name: list_name
+        type: string
+        description: "Name of the list to retrieve"
+    statement: "SELECT id, item, checked FROM checklists WHERE list_name = ? AND checked = 0 ORDER BY id ASC"
+
+toolsets:
+  pa_toolset:
+    - add_task
+    - get_tasks
+    - complete_task
+    - add_event
+    - get_events
+    - add_note
+    - search_notes
+    - add_checklist_item
+    - get_checklist

@@ -1,0 +1,296 @@
+import os
+import datetime
+from dotenv import load_dotenv
+from google.adk.agents import Agent, SequentialAgent
+from google.adk.tools.tool_context import ToolContext
+DB_PATH = os.environ.get("DB_PATH", "/tmp/pa_data.db")
+
+def _get_db():
+    import sqlite3
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL, description TEXT DEFAULT '',
+            due_date TEXT DEFAULT '', priority TEXT DEFAULT 'medium',
+            status TEXT DEFAULT 'pending');
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL, date TEXT NOT NULL,
+            time TEXT DEFAULT '', reminder_minutes INTEGER DEFAULT 30,
+            location TEXT DEFAULT '', notes TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL, content TEXT DEFAULT '',
+            tags TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now')));
+        CREATE TABLE IF NOT EXISTS checklists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            list_name TEXT NOT NULL, item TEXT NOT NULL,
+            checked INTEGER DEFAULT 0);
+    """)
+    conn.commit()
+    return conn
+
+
+load_dotenv()
+model_name = os.getenv("MODEL", "gemini-2.5-flash")
+
+
+def save_user_input(tool_context: ToolContext, user_message: str) -> dict:
+    """Save raw user message to agent state for downstream agents."""
+    tool_context.state["RAW_INPUT"] = user_message
+    return {"status": "saved", "message": user_message}
+
+
+def add_task(tool_context: ToolContext, title: str, description: str = "",
+             due_date: str = "", priority: str = "medium") -> dict:
+    """Add a new task. title required. Optional: description, due_date YYYY-MM-DD, priority low/medium/high."""
+    conn = _get_db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO tasks (title, description, due_date, priority, status) VALUES (?, ?, ?, ?, 'pending')",
+        (title, description, due_date, priority))
+    conn.commit()
+    task_id = c.lastrowid
+    conn.close()
+    return {"status": "success", "task_id": task_id, "title": title}
+
+
+def get_tasks(tool_context: ToolContext) -> list:
+    """Get all pending tasks ordered by priority and due date."""
+    conn = _get_db()
+    c = conn.cursor()
+    c.execute("""SELECT id, title, description, due_date, priority, status
+        FROM tasks WHERE status != 'done'
+        ORDER BY CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, due_date ASC""")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1], "description": r[2],
+             "due_date": r[3], "priority": r[4], "status": r[5]} for r in rows]
+
+
+def complete_task(tool_context: ToolContext, task_id: int) -> dict:
+    """Mark a task as done by its numeric ID."""
+    conn = _get_db()
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "success", "task_id": task_id}
+
+
+def add_event(tool_context: ToolContext, title: str, date: str,
+              time: str = "", reminder_minutes: int = 30,
+              location: str = "", notes: str = "") -> dict:
+    """Add a calendar event. title and date YYYY-MM-DD required. Optional: time HH:MM, reminder_minutes, location, notes."""
+    conn = _get_db()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO events (title, date, time, reminder_minutes, location, notes) VALUES (?, ?, ?, ?, ?, ?)",
+        (title, date, time, reminder_minutes, location, notes))
+    conn.commit()
+    event_id = c.lastrowid
+    conn.close()
+    return {"status": "success", "event_id": event_id, "title": title, "date": date}
+
+
+def get_events(tool_context: ToolContext) -> list:
+    """Get all upcoming events ordered by date and time."""
+    conn = _get_db()
+    c = conn.cursor()
+    c.execute("""SELECT id, title, date, time, reminder_minutes, location, notes
+        FROM events WHERE date >= date('now')
+        ORDER BY date ASC, time ASC""")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1], "date": r[2], "time": r[3],
+             "reminder_minutes": r[4], "location": r[5], "notes": r[6]} for r in rows]
+
+
+def add_note(tool_context: ToolContext, title: str, content: str, tags: str = "") -> dict:
+    """Save a note. title and content required. tags optional comma-separated."""
+    conn = _get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO notes (title, content, tags) VALUES (?, ?, ?)", (title, content, tags))
+    conn.commit()
+    note_id = c.lastrowid
+    conn.close()
+    return {"status": "success", "note_id": note_id, "title": title}
+
+
+def search_notes(tool_context: ToolContext, query: str) -> list:
+    """Search notes by keyword across title, content, and tags. Returns up to 5 results."""
+    conn = _get_db()
+    c = conn.cursor()
+    c.execute("""SELECT id, title, content, tags, created_at FROM notes
+        WHERE title LIKE ? OR content LIKE ? OR tags LIKE ?
+        ORDER BY created_at DESC LIMIT 5""",
+              (f"%{query}%", f"%{query}%", f"%{query}%"))
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1], "content": r[2],
+             "tags": r[3], "created_at": r[4]} for r in rows]
+
+
+def add_checklist_item(tool_context: ToolContext, list_name: str, item: str) -> dict:
+    """Add an item to a named checklist. list_name e.g. grocery, packing. item is the text."""
+    conn = _get_db()
+    conn.execute("INSERT INTO checklists (list_name, item) VALUES (?, ?)", (list_name, item))
+    conn.commit()
+    conn.close()
+    return {"status": "success", "list_name": list_name, "item": item}
+
+
+def get_checklist(tool_context: ToolContext, list_name: str) -> list:
+    """Get all unchecked items from a specific named checklist."""
+    conn = _get_db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, item, checked FROM checklists WHERE list_name = ? AND checked = 0 ORDER BY id ASC",
+        (list_name,))
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "item": r[1], "checked": r[2]} for r in rows]
+
+
+db_tools = [
+    add_task, get_tasks, complete_task,
+    add_event, get_events,
+    add_note, search_notes,
+    add_checklist_item, get_checklist,
+]
+
+
+def _build_intent_instruction():
+    import datetime
+    today = datetime.date.today()
+    tomorrow = today + datetime.timedelta(days=1)
+    day_name = today.strftime("%A")
+    next_days = {}
+    for i in range(1, 8):
+        d = today + datetime.timedelta(days=i)
+        next_days[d.strftime("%A")] = d.isoformat()
+    return (
+        "You are an intelligent NLP pre-processor for a personal productivity assistant.\n\n"
+        f"DATE CONTEXT (resolve all relative date words using these):\n"
+        f"- Today: {today.isoformat()} ({day_name})\n"
+        f"- Tomorrow: {tomorrow.isoformat()}\n"
+        f"- This week: {next_days}\n\n"
+        "RULE: NEVER output YYYY-MM-DD as a literal placeholder."
+        " Always resolve relative words like today/tomorrow/this Friday into real dates from DATE CONTEXT.\n\n"
+        "Read session state key RAW_INPUT containing the user full message.\n\n"
+        "Steps:\n"
+        "1. Clean and organize into clear bullet points.\n"
+        "2. Assign each point ONE category: TASK, EVENT, REMINDER, NOTE, CHECKLIST, or QUESTION.\n"
+        "3. Resolve all dates to real YYYY-MM-DD values, times to HH:MM.\n"
+        "4. Use the FINAL preference if user changed their mind.\n\n"
+        "Output ONLY valid JSON (no markdown, no extra text):\n"
+        '{\n'
+        '  "summary": "one sentence summary",\n'
+        '  "items": [\n'
+        '    {\n'
+        '      "category": "TASK|EVENT|REMINDER|NOTE|CHECKLIST|QUESTION",\n'
+        '      "content": "what to do or save",\n'
+        '      "date": "resolved YYYY-MM-DD or null",\n'
+        '      "time": "HH:MM or null",\n'
+        '      "priority": "high|medium|low or null",\n'
+        '      "location": "place or null",\n'
+        '      "list_name": "grocery|packing|shopping or null",\n'
+        '      "extra": "any detail"\n'
+        '    }\n'
+        '  ],\n'
+        '  "follow_up_question": "one question if needed else null"\n'
+        '}'
+    )
+
+
+intent_agent = Agent(
+    name="intent_agent",
+    model=model_name,
+    description="Classifies user input into structured intents with resolved dates.",
+    instruction=_build_intent_instruction(),
+    output_key="PARSED_INTENTS",
+)
+
+calendar_agent = Agent(
+    name="calendar_agent",
+    model=model_name,
+    description="Saves and retrieves calendar events.",
+    instruction="""
+You are the Calendar Manager sub-agent.
+Read session state PARSED_INTENTS. Find items with category EVENT or REMINDER.
+For each: call add_event with title, date, time, reminder_minutes (default 30), location, notes.
+If none: say No events to process.
+Then call get_events to list all upcoming events.
+""",
+    tools=db_tools,
+    output_key="CALENDAR_RESULT",
+)
+
+task_agent = Agent(
+    name="task_agent",
+    model=model_name,
+    description="Saves and retrieves tasks and checklists.",
+    instruction="""
+You are the Task Manager sub-agent.
+Read session state PARSED_INTENTS. Find items with category TASK or CHECKLIST.
+For TASK: call add_task with title, description, due_date, priority.
+For CHECKLIST: call add_checklist_item with list_name and item (one call per item).
+If none: say No tasks to process.
+Then call get_tasks.
+""",
+    tools=db_tools,
+    output_key="TASK_RESULT",
+)
+
+notes_agent = Agent(
+    name="notes_agent",
+    model=model_name,
+    description="Saves notes and answers questions.",
+    instruction="""
+You are the Notes Manager sub-agent.
+Read session state PARSED_INTENTS. Find items with category NOTE or QUESTION.
+For NOTE: call add_note with short title, content, and tags.
+For QUESTION: answer from knowledge, then save Q+A as a note.
+If none: say No notes to process.
+""",
+    tools=db_tools,
+    output_key="NOTES_RESULT",
+)
+
+response_agent = Agent(
+    name="response_agent",
+    model=model_name,
+    description="Synthesizes all results into a friendly final reply.",
+    instruction="""
+You are the Response Synthesizer.
+Read session state: PARSED_INTENTS, CALENDAR_RESULT, TASK_RESULT, NOTES_RESULT.
+Reply format:
+1. Here is what I have set up for you:
+2. Calendar entries (dates and reminder times)
+3. Tasks (with priorities and due dates)
+4. Notes and checklist items
+5. Ask follow_up_question from PARSED_INTENTS if present
+6. One encouraging closing line
+Be warm and concise. Max 2 emoji.
+""",
+)
+
+pa_workflow = SequentialAgent(
+    name="pa_workflow",
+    description="Full workflow: classify, save events, save tasks, save notes, synthesize reply.",
+    sub_agents=[intent_agent, calendar_agent, task_agent, notes_agent, response_agent],
+)
+
+root_agent = Agent(
+    name="productivity_assistant",
+    model=model_name,
+    description="Personal AI productivity assistant for tasks, events, notes, and checklists.",
+    instruction="""
+You are a warm Personal Productivity Assistant powered by Google AI.
+On first message or greeting: say Hi! I am your Productivity Assistant. Tell me anything on your mind — tasks, events, reminders, notes, or shopping lists. I will organize everything for you!
+When user sends content: call save_user_input passing their full message as user_message, then transfer to pa_workflow.
+""",
+    tools=[save_user_input],
+    sub_agents=[pa_workflow],
+)
